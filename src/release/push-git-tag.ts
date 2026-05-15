@@ -6,7 +6,11 @@ export const pushGitTag = async (tag: string, ctx: AppContext) => {
   console.log("Pushing git tag", tag)
   let git: SimpleGit = simpleGit(ctx.current_directory)
 
-  await configureOrigin(git)
+  const cleanup = await configureOrigin(git)
 
-  await git.push("origin", tag)
+  try {
+    await git.push("origin", tag)
+  } finally {
+    if (cleanup) await cleanup()
+  }
 }

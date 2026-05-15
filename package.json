@@ -8,6 +8,7 @@
   },
   "scripts": {
     "cli": "esr ./cli.ts",
+    "test": "npx tsx test/configure-origin.test.ts",
     "test:analyze": "esr ./cli.ts analyze",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",

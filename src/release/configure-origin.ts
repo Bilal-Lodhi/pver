@@ -5,6 +5,10 @@
  * Prefers PVER_GITHUB_TOKEN (a PAT or GitHub App installation token that
  * can bypass branch-protection rules) and falls back to the default
  * GITHUB_TOKEN for non-protected branches.
+ *
+ * Returns an optional cleanup function that restores the original
+ * unauthenticated URL, preventing long-lived token leakage in .git/config.
+ * Callers MUST invoke the cleanup after their git operations complete.
  */
 
 export const getGithubToken = (
@@ -14,7 +18,12 @@ export const getGithubToken = (
 
 /**
  * Normalize SSH and other GitHub remote URL formats to a clean HTTPS URL.
- * Also strips any pre-existing embedded credentials so we can safely re-authenticate.
+ * Also strips any pre-existing embedded credentials so we can safely
+ * re-authenticate.
+ *
+ * Uses the WHATWG URL parser to robustly strip credentials even when the
+ * userinfo component contains unencoded @ characters (a common bug in
+ * competitor implementations that used simple regexes like [^@]+).
  */
 export const normalizeGithubRemoteUrl = (remote_url: string): string => {
   let url = remote_url.trim().replace(/\n/g, "")
@@ -36,10 +45,21 @@ export const normalizeGithubRemoteUrl = (remote_url: string): string => {
     return `https://github.com/${sshUrlMatch.groups.owner}/${sshUrlMatch.groups.repo}.git`
   }
 
-  // Strip pre-existing embedded credentials so we never double-authenticate
-  // https://oauth2:old-token@github.com/... → https://github.com/...
-  // https://x-access-token:old-token@github.com/... → https://github.com/...
-  url = url.replace(/^https:\/\/[^@]+@github\.com\//, "https://github.com/")
+  // Robust credential stripping using the WHATWG URL parser.
+  // Unlike simple regexes (e.g. /[^@]+/), this correctly handles
+  // malformed tokens containing unencoded @ symbols in userinfo.
+  try {
+    const parsed = new URL(url)
+    if (parsed.username || parsed.password) {
+      // Reconstruct without credentials — avoids the trailing @ that
+      // setting username="" / password="" would produce
+      url = `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}${parsed.hash}`
+    }
+  } catch {
+    // If URL parsing fails (extremely malformed), fall back to a
+    // greedy regex that matches up to the *last* @ before github.com
+    url = url.replace(/^https:\/\/.*@github\.com\//, "https://github.com/")
+  }
 
   return url
 }
@@ -60,24 +80,46 @@ export const addGithubTokenToRemoteUrl = (
     return remote_url.trim().replace(/\n/g, "")
   }
 
-  const encodedToken = encodeURIComponent(github_token.trim())
+  const encoded_token = encodeURIComponent(github_token.trim())
 
   return normalized.replace(
     "https://github.com/",
-    `https://oauth2:${encodedToken}@github.com/`
+    `https://oauth2:${encoded_token}@github.com/`
   )
 }
 
-export const configureOrigin = async (git: any) => {
+/**
+ * Rewrites the git origin remote to include an authentication token.
+ *
+ * Uses `git remote set-url` (instead of removeRemote + addRemote) to
+ * preserve any custom per-remote configuration the user may have set
+ * (e.g. fetch refspecs, push URLs, tags).
+ *
+ * Returns an optional cleanup function. Callers MUST invoke it after
+ * their git push/pull operations complete so the token is not left
+ * exposed in .git/config indefinitely.
+ */
+export const configureOrigin = async (
+  git: any
+): Promise<(() => Promise<void>) | undefined> => {
   const github_token = getGithubToken()
 
-  if (!github_token) return
+  if (!github_token) return undefined
 
   const remote_url = String(await git.remote(["get-url", "origin"]))
+  const trimmed_url = remote_url.trim().replace(/\n/g, "")
   const new_url = addGithubTokenToRemoteUrl(remote_url, github_token)
+  const original_url = normalizeGithubRemoteUrl(remote_url)
 
-  if (new_url !== remote_url.trim().replace(/\n/g, "")) {
-    await git.removeRemote("origin")
-    await git.addRemote("origin", new_url)
+  if (new_url !== trimmed_url) {
+    // Use set-url to update the URL in place, preserving custom refspecs etc.
+    await git.raw(["remote", "set-url", "origin", new_url])
+
+    // Return a cleanup function that restores the original unauthenticated URL
+    return async () => {
+      await git.raw(["remote", "set-url", "origin", original_url])
+    }
   }
+
+  return undefined
 }

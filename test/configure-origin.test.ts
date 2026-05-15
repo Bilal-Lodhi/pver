@@ -70,6 +70,23 @@ assert.equal(
   "x-access-token authenticated remote should have credentials stripped"
 )
 
+// NEW: Test that unencoded @ in userinfo is correctly stripped (the WHATWG
+// URL parser handles this where simple regexes would fail)
+assert.equal(
+  normalizeGithubRemoteUrl(
+    "https://token:with@unencoded@github.com/tscircuit/pver.git"
+  ),
+  "https://github.com/tscircuit/pver.git",
+  "Credentials containing unencoded @ symbols should be fully stripped"
+)
+
+// NEW: Test that simple credentials at the very end work too
+assert.equal(
+  normalizeGithubRemoteUrl("https://user:pass@github.com/owner/repo.git"),
+  "https://github.com/owner/repo.git",
+  "Standard user:pass@ credentials should be stripped"
+)
+
 // ---------------------------------------------------------------------------
 // Unit tests: addGithubTokenToRemoteUrl
 // ---------------------------------------------------------------------------
@@ -132,28 +149,26 @@ assert.equal(
 // Integration tests: configureOrigin
 // ---------------------------------------------------------------------------
 
-type GitCall = {
-  method: "remote" | "removeRemote" | "addRemote"
-  args: unknown[]
+type RawCall = {
+  args: string[]
 }
 
 function createMockGit(initial_url: string) {
   let current_url = initial_url
-  const calls: GitCall[] = []
+  const raw_calls: RawCall[] = []
 
   return {
     remote: async (args: string[]) => {
-      calls.push({ method: "remote", args })
       return `${current_url}\n`
     },
-    removeRemote: async (name: string) => {
-      calls.push({ method: "removeRemote", args: [name] })
+    raw: async (args: string[]) => {
+      raw_calls.push({ args })
+      if (args[0] === "remote" && args[1] === "set-url") {
+        current_url = args[3]
+      }
+      return ""
     },
-    addRemote: async (name: string, url: string) => {
-      calls.push({ method: "addRemote", args: [name, url] })
-      current_url = url
-    },
-    getCalls: () => calls,
+    getRawCalls: () => raw_calls,
     getCurrentUrl: () => current_url,
   }
 }
@@ -189,7 +204,7 @@ async function withEnv(
 }
 
 async function runConfigureOriginTests() {
-  // Test 1: PVER_GITHUB_TOKEN takes precedence
+  // Test 1: PVER_GITHUB_TOKEN takes precedence and cleanup restores origin
   await withEnv(
     {
       GITHUB_TOKEN: "github-token",
@@ -198,17 +213,30 @@ async function runConfigureOriginTests() {
     async () => {
       const git = createMockGit("git@github.com:tscircuit/pver.git")
 
-      await configureOrigin(git)
+      const cleanup = await configureOrigin(git)
 
+      assert.ok(cleanup, "configureOrigin should return a cleanup function")
       assert.equal(
         git.getCurrentUrl(),
         "https://oauth2:pver-token@github.com/tscircuit/pver.git",
         "configureOrigin should rewrite SSH origin using PVER_GITHUB_TOKEN"
       )
+
+      // Verify set-url was used (not removeRemote + addRemote)
+      const raw_calls = git.getRawCalls()
       assert.deepEqual(
-        git.getCalls().map((call) => call.method),
-        ["remote", "removeRemote", "addRemote"],
-        "configureOrigin should only rewrite origin when the URL changes"
+        raw_calls[0].args,
+        ["remote", "set-url", "origin", "https://oauth2:pver-token@github.com/tscircuit/pver.git"],
+        "configureOrigin should use git remote set-url, preserving custom refspecs"
+      )
+
+      // Verify cleanup restores the original URL
+      if (cleanup) await cleanup()
+
+      assert.equal(
+        git.getCurrentUrl(),
+        "https://github.com/tscircuit/pver.git",
+        "cleanup should restore the unauthenticated origin URL"
       )
     }
   )
@@ -222,12 +250,13 @@ async function runConfigureOriginTests() {
     async () => {
       const git = createMockGit("https://github.com/tscircuit/pver.git")
 
-      await configureOrigin(git)
+      const cleanup = await configureOrigin(git)
 
+      assert.equal(cleanup, undefined, "configureOrigin should return undefined when no token is set")
       assert.deepEqual(
-        git.getCalls(),
+        git.getRawCalls(),
         [],
-        "configureOrigin should not inspect or rewrite origin when no token is set"
+        "configureOrigin should not execute any git commands when no token is set"
       )
     }
   )
@@ -243,17 +272,13 @@ async function runConfigureOriginTests() {
         "https://oauth2:new-token@github.com/tscircuit/pver.git"
       )
 
-      await configureOrigin(git)
+      const cleanup = await configureOrigin(git)
 
+      assert.equal(cleanup, undefined, "configureOrigin should return undefined when URL is already correct")
       assert.deepEqual(
-        git.getCalls().map((call) => call.method),
-        ["remote"],
+        git.getRawCalls(),
+        [],
         "configureOrigin should leave already-up-to-date origins alone"
-      )
-      assert.equal(
-        git.getCurrentUrl(),
-        "https://oauth2:new-token@github.com/tscircuit/pver.git",
-        "configureOrigin should not overwrite an existing correctly-authenticated origin"
       )
     }
   )
@@ -267,12 +292,65 @@ async function runConfigureOriginTests() {
     async () => {
       const git = createMockGit("git@github.com:owner/repo.git")
 
-      await configureOrigin(git)
+      const cleanup = await configureOrigin(git)
 
+      assert.ok(cleanup, "configureOrigin should return a cleanup function")
       assert.equal(
         git.getCurrentUrl(),
         "https://oauth2:fallback-token@github.com/owner/repo.git",
         "configureOrigin should fall back to GITHUB_TOKEN when PVER_GITHUB_TOKEN is not set"
+      )
+
+      if (cleanup) await cleanup()
+
+      assert.equal(
+        git.getCurrentUrl(),
+        "https://github.com/owner/repo.git",
+        "cleanup should restore the original URL"
+      )
+    }
+  )
+
+  // Test 5: Credential stripping handles unencoded @ in userinfo
+  await withEnv(
+    {
+      GITHUB_TOKEN: "clean-token",
+      PVER_GITHUB_TOKEN: undefined,
+    },
+    async () => {
+      const git = createMockGit(
+        "https://token:with@unencoded@github.com/owner/repo.git"
+      )
+
+      const cleanup = await configureOrigin(git)
+
+      assert.ok(cleanup, "configureOrigin should handle URLs with unencoded @ in credentials")
+      assert.equal(
+        git.getCurrentUrl(),
+        "https://oauth2:clean-token@github.com/owner/repo.git",
+        "URLs with unencoded @ in credentials should be handled correctly"
+      )
+
+      if (cleanup) await cleanup()
+    }
+  )
+
+  // Test 6: configureOrigin only calls raw once (no redundant operations)
+  await withEnv(
+    {
+      GITHUB_TOKEN: "token",
+      PVER_GITHUB_TOKEN: undefined,
+    },
+    async () => {
+      const git = createMockGit("https://github.com/owner/repo.git")
+
+      const cleanup = await configureOrigin(git)
+
+      assert.ok(cleanup, "configureOrigin should return a cleanup function")
+      assert.equal(
+        git.getRawCalls().length,
+        1,
+        "configureOrigin should make exactly one git raw call (set-url) when URL needs updating"
       )
     }
   )

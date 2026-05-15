@@ -6,7 +6,7 @@ export const syncWithRemote = async (ctx: AppContext) => {
   console.log("Syncing with remote main")
   let git: SimpleGit = simpleGit(ctx.current_directory)
 
-  await configureOrigin(git)
+  const cleanup = await configureOrigin(git)
 
   // Pull main and rebase to sync with remote
   // This establishes the origin/main reference needed for workflows
@@ -32,5 +32,7 @@ export const syncWithRemote = async (ctx: AppContext) => {
       }
     }
     throw e
+  } finally {
+    if (cleanup) await cleanup()
   }
 }
